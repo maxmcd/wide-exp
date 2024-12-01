@@ -1,5 +1,7 @@
 import { createClient, type InsertResult } from "@clickhouse/client";
 import { DateTime } from "luxon";
+import fs from "node:fs";
+import readline from "node:readline";
 const schemaVersion = 3;
 
 function _client() {
@@ -12,6 +14,7 @@ function _client() {
 
 export async function runMigrations() {
 	for (const migration of [
+		`DROP TABLE IF EXISTS logs_${schemaVersion}`,
 		`
 CREATE TABLE IF NOT EXISTS logs_${schemaVersion}
 (
@@ -37,10 +40,23 @@ CREATE TABLE IF NOT EXISTS logs_${schemaVersion}
 PARTITION BY toDate(_timestamp)
 ORDER BY (_tenantId, _traceId, _timestamp)
 TTL _ttl DELETE`,
+		`CREATE TABLE IF NOT EXISTS logs_json (
+    data JSON(),
+	_tenantId LowCardinality(String) NOT NULL CODEC(ZSTD(1)),
+    _timestamp DateTime64(3) NOT NULL CODEC(DoubleDelta, LZ4),
+	_now DateTime64(3) NOT NULL CODEC(ZSTD(1)),
+  _ttl DateTime NOT NULL,
+  INDEX idx_tenant_bloom _tenantId TYPE bloom_filter GRANULARITY 4
+) ENGINE = MergeTree()
+PARTITION BY toDate(_timestamp)
+ORDER BY (_tenantId, _timestamp)`,
 	]) {
 		try {
 			await _client().command({
 				query: migration,
+				clickhouse_settings: {
+					allow_experimental_json_type: 1,
+				},
 			});
 		} catch (e) {
 			console.error(migration, e);
@@ -120,6 +136,18 @@ const writeRowsToClickhouse = async (
 			_startTime: startTime ? new Date(startTime) : null,
 			_endTime: endTime ? new Date(endTime) : null,
 			_duration: duration || null,
+			_source: [
+				"json",
+				"logs",
+				"metrics",
+				"traces",
+				"events",
+				"telemetry",
+				"monitoring",
+				"analytics",
+				"system",
+				"app",
+			][Math.floor(Math.random() * 10)],
 			"string.names": Object.keys(row.string),
 			"string.values": Object.values(row.string),
 			"number.names": Object.keys(row.number),
@@ -142,8 +170,47 @@ const writeRowsToClickhouse = async (
 
 await runMigrations();
 
-import fs from "node:fs";
-import readline from "node:readline";
+const writeJsonRowsToClickhouse = async (
+	userId: string,
+	rows: any[],
+): Promise<InsertResult> => {
+	// Write to ClickHouse
+	const now = new Date();
+	const ttl = new Date(now.getTime() + 1 * 24 * 60 * 60 * 1000); // 1 day TTL
+
+	const clickhouseRows = rows.map((row) => {
+		// Find trace/span related fields if they exist
+		const traceId = row.traceId || row.trace_id;
+		const spanId = row.spanId || row.span_id;
+		const parentSpanId = row.parentSpanId || row.parent_span_id;
+		// TOOD: handle more cases
+		const startTime = row.startTime || row.start_time;
+		const endTime = row.endTime || row.end_time;
+		const duration = row.duration;
+
+		const timestamp = row.timestamp || row.ts || row.dt;
+		const parsedTimestamp = timestamp
+			? DateTime.fromISO(timestamp).toJSDate()
+			: null;
+		return {
+			_tenantId: userId,
+			_timestamp: parsedTimestamp || now,
+			_now: now,
+			_ttl: ttl,
+			data: row,
+		};
+	});
+
+	return await _client().insert({
+		table: "logs_json",
+		values: clickhouseRows,
+		format: "JSONEachRow",
+		clickhouse_settings: {
+			date_time_input_format: "best_effort",
+			date_time_output_format: "iso",
+		},
+	});
+};
 
 const processLogFile = async (filePath: string) => {
 	const fileStream = fs.createReadStream(filePath);
@@ -159,7 +226,8 @@ const processLogFile = async (filePath: string) => {
 			continue;
 		}
 		const rows = parseRows(lines);
-		await writeRowsToClickhouse("456", rows);
+		await writeRowsToClickhouse("123", rows);
+		// await writeJsonRowsToClickhouse("456", lines);
 		lines = []; // Reset array for next batch
 	}
 };
